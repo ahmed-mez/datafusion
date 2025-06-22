@@ -343,6 +343,7 @@ impl PhysicalExpr for BinaryExpr {
         self
     }
 
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
         BinaryTypeCoercer::new(
             &self.left.data_type(input_schema)?,
