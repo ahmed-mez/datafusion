@@ -2430,8 +2430,9 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "paste",
- "petgraph 0.8.1",
+ "petgraph 0.8.2",
  "rand 0.9.1",
+ "recursive",
  "rstest",
 ]
 
@@ -2644,6 +2645,7 @@ dependencies = [
  "object_store",
  "pbjson-types",
  "prost",
+ "recursive",
  "serde_json",
  "substrait",
  "tokio",
@@ -4547,9 +4549,9 @@ dependencies = [
 
 [[package]]
 name = "petgraph"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a98c6720655620a521dcc722d0ad66cd8afd5d86e34a89ef691c50b7b24de06"
+checksum = "54acf3a685220b533e437e264e4d932cfbdc4cc7ec0cd232ed73c08d03b8a7ca"
 dependencies = [
  "fixedbitset",
  "hashbrown 0.15.3",

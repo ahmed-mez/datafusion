@@ -365,6 +365,7 @@ fn extract_or_clauses_for_join<'a>(
 /// Otherwise, return None.
 ///
 /// For other clause, apply the rule above to extract clause.
+#[cfg_attr(feature = "recursive_protection", recursive::recursive)]
 fn extract_or_clause(expr: &Expr, schema_columns: &HashSet<Column>) -> Option<Expr> {
     let mut predicate = None;
 
@@ -763,6 +764,7 @@ impl OptimizerRule for PushDownFilter {
         true
     }
 
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
     fn rewrite(
         &self,
         plan: LogicalPlan,
