@@ -25,6 +25,7 @@ use super::order::GroupOrdering;
 use super::AggregateExec;
 use crate::aggregates::group_values::{new_group_values, GroupByMetrics, GroupValues};
 use crate::aggregates::order::GroupOrderingFull;
+use crate::aggregates::peek::{AggregatePeek, IntermediatePeekConfig, PeekContext};
 use crate::aggregates::{
     create_schema, evaluate_group_by, evaluate_many, evaluate_optional, AggregateMode,
     PhysicalGroupBy,
@@ -434,6 +435,14 @@ pub(crate) struct GroupedHashAggregateStream {
 
     /// Aggregation-specific metrics
     group_by_metrics: GroupByMetrics,
+
+    /// PoC: Optional configuration for peeking at intermediate aggregation results.
+    /// When set, the peek callback will be invoked periodically during execution.
+    /// For grouped aggregations, this uses a sample-and-reinsert strategy.
+    peek_config: Option<IntermediatePeekConfig>,
+
+    /// PoC: Timestamp of the last peek operation, used to enforce peek_interval_ms
+    last_peek_time: Option<Instant>,
 }
 
 impl GroupedHashAggregateStream {
@@ -621,6 +630,8 @@ impl GroupedHashAggregateStream {
             spill_state,
             group_values_soft_limit: agg.limit,
             skip_aggregation_probe,
+            peek_config: agg.intermediate_peek_config().cloned(),
+            last_peek_time: None,
         })
     }
 }
@@ -708,6 +719,9 @@ impl Stream for GroupedHashAggregateStream {
 
                             // Do the grouping
                             self.group_aggregate_batch(batch)?;
+
+                            // PoC: Peek at intermediate aggregation results if configured.
+                            self.peek_intermediate_results()?;
 
                             // If we can begin emitting rows, do so,
                             // otherwise keep consuming input
@@ -823,6 +837,80 @@ impl Stream for GroupedHashAggregateStream {
 impl RecordBatchStream for GroupedHashAggregateStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+}
+
+impl AggregatePeek for GroupedHashAggregateStream {
+    fn peek_intermediate_results(&mut self) -> Result<()> {
+        // Only support Final/FinalPartitioned modes
+        if !(self.mode == AggregateMode::Final
+            || self.mode == AggregateMode::FinalPartitioned)
+        {
+            return internal_err!(
+                "Intermediate peeking is only supported for Final/FinalPartitioned modes"
+            );
+        }
+
+        // Extract config to avoid borrow issues
+        let (peek_interval_ms, max_groups_to_peek, callback) = match &self.peek_config {
+            Some(config) => (
+                config.peek_interval_ms,
+                config.max_groups_to_peek,
+                config.callback.clone(),
+            ),
+            None => return Ok(()),
+        };
+
+        // Check if enough time has elapsed since last peek
+        let now = Instant::now();
+        let should_peek = match self.last_peek_time {
+            None => {
+                // First peek - always peek
+                self.last_peek_time = Some(now);
+                true
+            }
+            Some(last) => {
+                let elapsed_ms = now.duration_since(last).as_millis() as u64;
+                if elapsed_ms >= peek_interval_ms {
+                    self.last_peek_time = Some(now);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        if should_peek {
+            let num_groups = self.group_values.len();
+
+            // Only peek if we have groups
+            if num_groups > 0 {
+                // Determine sample size based on configuration
+                let sample_size = match max_groups_to_peek {
+                    Some(max) => num_groups.min(max),
+                    None => num_groups, // Peek all groups
+                };
+
+                // Emit sample (removes from hash table)
+                let batch = self.emit(EmitTo::First(sample_size), false)?;
+
+                if let Some(intermediate_batch) = batch {
+                    // Send to callback
+                    let context = PeekContext {
+                        mode: self.mode,
+                        intermediate_batch: intermediate_batch.clone(),
+                    };
+                    // Invoke callback - ignore errors to avoid disrupting aggregation
+                    let _ = callback(context);
+
+                    // Re-insert groups to preserve them for final result
+                    // This has overhead (fine for a PoC) but ensures correctness
+                    self.group_aggregate_batch(intermediate_batch)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

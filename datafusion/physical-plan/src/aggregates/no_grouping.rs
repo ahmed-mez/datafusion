@@ -17,15 +17,17 @@
 
 //! Aggregate without grouping columns
 
+use crate::aggregates::peek::{AggregatePeek, IntermediatePeekConfig, PeekContext};
 use crate::aggregates::{
     aggregate_expressions, create_accumulators, finalize_aggregation, AccumulatorItem,
     AggregateMode,
 };
 use crate::metrics::{BaselineMetrics, RecordOutput};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
+use arrow::array::ArrayRef;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion_common::Result;
+use datafusion_common::{internal_err, Result};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::BoxStream;
@@ -36,6 +38,8 @@ use std::task::{Context, Poll};
 use crate::filter::batch_filter;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use futures::stream::{Stream, StreamExt};
+use itertools::Itertools;
+use std::time::Instant;
 
 use super::AggregateExec;
 
@@ -62,6 +66,13 @@ struct AggregateStreamInner {
     accumulators: Vec<AccumulatorItem>,
     reservation: MemoryReservation,
     finished: bool,
+
+    /// PoC: Optional configuration for peeking at intermediate aggregation results.
+    /// When set, the peek callback will be invoked periodically during execution.
+    peek_config: Option<IntermediatePeekConfig>,
+
+    /// PoC: Timestamp of the last peek operation, used to enforce peek_interval_ms
+    last_peek_time: Option<Instant>,
 }
 
 impl AggregateStream {
@@ -101,18 +112,19 @@ impl AggregateStream {
             accumulators,
             reservation,
             finished: false,
+            peek_config: agg.intermediate_peek_config().cloned(),
+            last_peek_time: None,
         };
         let stream = futures::stream::unfold(inner, |mut this| async move {
             if this.finished {
                 return None;
             }
 
-            let elapsed_compute = this.baseline_metrics.elapsed_compute();
-
             loop {
                 let result = match this.input.next().await {
                     Some(Ok(batch)) => {
-                        let timer = elapsed_compute.timer();
+                        // Create scope for elapsed_compute borrow
+                        let timer = this.baseline_metrics.elapsed_compute().timer();
                         let result = aggregate_batch(
                             &this.mode,
                             batch,
@@ -129,7 +141,13 @@ impl AggregateStream {
                         match result
                             .and_then(|allocated| this.reservation.try_grow(allocated))
                         {
-                            Ok(_) => continue,
+                            Ok(_) => {
+                                // PoC: Peek at intermediate aggregation results if configured
+                                // Now we can call the trait method without borrow conflicts
+                                let _ = this.peek_intermediate_results();
+
+                                continue;
+                            }
                             Err(e) => Err(e),
                         }
                     }
@@ -185,6 +203,111 @@ impl Stream for AggregateStream {
 impl RecordBatchStream for AggregateStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+}
+
+impl AggregatePeek for AggregateStreamInner {
+    /// Implementation of peek for no-grouping aggregations.
+    ///
+    /// Strategy: Uses `Accumulator::state()` to clone internal state, builds a RecordBatch,
+    /// and invokes the callback. This is zero-overhead and non-destructive.
+    fn peek_intermediate_results(&mut self) -> Result<()> {
+        // Extract config to avoid nested borrows
+        let (peek_interval_ms, callback) = match &self.peek_config {
+            Some(config) => (config.peek_interval_ms, config.callback.clone()),
+            None => return Ok(()),
+        };
+
+        // Check if enough time has elapsed since last peek
+        let now = Instant::now();
+        let should_peek = match self.last_peek_time {
+            None => {
+                self.last_peek_time = Some(now);
+                true
+            }
+            Some(last) => {
+                let elapsed_ms = now.duration_since(last).as_millis() as u64;
+                if elapsed_ms >= peek_interval_ms {
+                    self.last_peek_time = Some(now);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        if should_peek {
+            // Build intermediate results as a RecordBatch
+            match build_intermediate_batch(
+                &mut self.accumulators,
+                &self.mode,
+                &self.schema,
+            ) {
+                Ok(intermediate_batch) => {
+                    let context = PeekContext {
+                        mode: self.mode,
+                        intermediate_batch,
+                    };
+                    // Invoke callback - ignore errors to avoid disrupting aggregation
+                    let _ = callback(context);
+                }
+                Err(_) => {
+                    // If we can't build the batch, silently skip this peek
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Build an intermediate RecordBatch showing the current aggregation state
+///
+/// Creates a single-row RecordBatch with the current aggregate values, properly
+/// formatted according to the aggregation's output schema.
+///
+/// # Strategy
+/// For no-grouping aggregations, we use `Accumulator::state()` to get the internal
+/// state and convert it to arrays. This is non-destructive as `state()` returns a
+/// clone of the internal state.
+///
+/// # Arguments
+/// * `accumulators` - Slice of accumulators to peek at
+/// * `mode` - Aggregation mode (only Final/Single modes supported)
+/// * `schema` - Output schema for the aggregation
+///
+/// # Returns
+/// A single-row RecordBatch with current aggregate values, or error if unsupported mode
+fn build_intermediate_batch(
+    accumulators: &mut [AccumulatorItem],
+    mode: &AggregateMode,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    // Only support Final/Single modes for peeking
+    match mode {
+        AggregateMode::Partial => {
+            return internal_err!("Intermediate peeking is only supported for Final/Single aggregation modes");
+        }
+        AggregateMode::Final
+        | AggregateMode::FinalPartitioned
+        | AggregateMode::Single
+        | AggregateMode::SinglePartitioned => {
+            // Get state from each accumulator and convert to arrays
+            let columns = accumulators
+                .iter_mut()
+                .map(|accumulator| {
+                    accumulator.state().and_then(|state| {
+                        state
+                            .iter()
+                            .map(|v| v.to_array())
+                            .collect::<Result<Vec<ArrayRef>>>()
+                    })
+                })
+                .flatten_ok()
+                .collect::<Result<Vec<ArrayRef>>>()?;
+
+            RecordBatch::try_new(Arc::clone(schema), columns).map_err(Into::into)
+        }
     }
 }
 

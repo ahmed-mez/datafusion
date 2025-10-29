@@ -21,6 +21,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use super::{DisplayAs, ExecutionPlanProperties, PlanProperties};
+use crate::aggregates::peek::IntermediatePeekConfig;
 use crate::aggregates::{
     no_grouping::AggregateStream, row_hash::GroupedHashAggregateStream,
     topk_stream::GroupedTopKAggregateStream,
@@ -58,6 +59,7 @@ use itertools::Itertools;
 pub mod group_values;
 mod no_grouping;
 pub mod order;
+pub mod peek;
 mod row_hash;
 mod topk;
 mod topk_stream;
@@ -412,6 +414,11 @@ pub struct AggregateExec {
     /// Describes how the input is ordered relative to the group by columns
     input_order_mode: InputOrderMode,
     cache: PlanProperties,
+
+    /// PoC: Optional configuration for peeking at intermediate aggregation results.
+    /// When set, enables periodic callbacks with intermediate results during execution.
+    /// Use `with_intermediate_peek_config()` to configure.
+    intermediate_peek_config: Option<IntermediatePeekConfig>,
 }
 
 impl AggregateExec {
@@ -436,6 +443,7 @@ impl AggregateExec {
             input: Arc::clone(&self.input),
             schema: Arc::clone(&self.schema),
             input_schema: Arc::clone(&self.input_schema),
+            intermediate_peek_config: self.intermediate_peek_config.clone(),
         }
     }
 
@@ -561,6 +569,7 @@ impl AggregateExec {
             limit: None,
             input_order_mode,
             cache,
+            intermediate_peek_config: None,
         })
     }
 
@@ -574,6 +583,37 @@ impl AggregateExec {
         self.limit = limit;
         self
     }
+
+    /// Set the intermediate peek configuration for this AggregateExec (PoC)
+    ///
+    /// This enables peeking at intermediate aggregation results during execution.
+    /// The provided callback will be invoked periodically with a `PeekContext` containing
+    /// the current aggregation state as an Arrow RecordBatch.
+    ///
+    /// # Arguments
+    /// * `config` - Peek configuration with callback and interval settings
+    ///
+    /// # Example
+    /// ```ignore
+    /// let peek_config = IntermediatePeekConfig::new(1000, |ctx| {
+    ///     println!("Intermediate: {:?}", ctx.intermediate_batch);
+    ///     Ok(())
+    /// });
+    /// let agg = agg_exec.with_intermediate_peek_config(Some(peek_config));
+    /// ```
+    pub fn with_intermediate_peek_config(
+        mut self,
+        config: Option<IntermediatePeekConfig>,
+    ) -> Self {
+        self.intermediate_peek_config = config;
+        self
+    }
+
+    /// Get the intermediate peek configuration
+    pub(crate) fn intermediate_peek_config(&self) -> Option<&IntermediatePeekConfig> {
+        self.intermediate_peek_config.as_ref()
+    }
+
     /// Grouping expressions
     pub fn group_expr(&self) -> &PhysicalGroupBy {
         &self.group_by

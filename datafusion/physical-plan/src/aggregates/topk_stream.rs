@@ -18,6 +18,7 @@
 //! A memory-conscious aggregation implementation that limits group buckets to a fixed number
 
 use crate::aggregates::group_values::GroupByMetrics;
+use crate::aggregates::peek::AggregatePeek;
 use crate::aggregates::topk::priority_map::PriorityMap;
 use crate::aggregates::{
     aggregate_expressions, evaluate_group_by, evaluate_many, AggregateExec,
@@ -93,6 +94,15 @@ impl GroupedTopKAggregateStream {
 impl RecordBatchStream for GroupedTopKAggregateStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+}
+
+impl AggregatePeek for GroupedTopKAggregateStream {
+    fn peek_intermediate_results(&mut self) -> Result<()> {
+        // PoC: TopK aggregation peeking is not implemented yet
+        datafusion_common::not_impl_err!(
+            "Intermediate peeking is not yet implemented for TopK aggregations"
+        )
     }
 }
 

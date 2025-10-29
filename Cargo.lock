@@ -2209,6 +2209,7 @@ dependencies = [
  "datafusion",
  "datafusion-ffi",
  "datafusion-physical-expr-adapter",
+ "datafusion-physical-plan",
  "datafusion-proto",
  "env_logger",
  "futures",
